@@ -1,0 +1,2 @@
+{"resourceType":"Patient","id":"P1","gender":"female","birthDate":"1990-03-04",
+ "identifier":[{"system":"id-card","value":"ID-001"}]}

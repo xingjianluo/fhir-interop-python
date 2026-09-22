@@ -1,0 +1,4 @@
+{"resourceType":"Observation","id":"O1","status":"final",
+ "code":{"coding":[{"system":"http://loinc.org","code":"2345-7","text":"Glucose"}]},
+ "subject":{"reference":"Patient/P1"},"encounter":{"reference":"Encounter/E1"},
+ "valueQuantity":{"value":5.4,"unit":"mmol/L"},"effectiveDateTime":"2026-09-20T08:15:00Z"}

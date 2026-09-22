@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""兼容入口：uvicorn/fastapi 可直接指向 main:app。"""
 
-app = FastAPI()
+from fhir_pipeline.api import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
