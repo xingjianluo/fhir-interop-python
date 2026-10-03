@@ -6,6 +6,7 @@
 - POST /fhir/{resource_type}/{rid}    新建指定 id（与 POST 集合语义一致）
 - GET  /fhir/{resource_type}/{rid}    读取当前版本
 - GET  /fhir/{resource_type}/{rid}/_history  历史版本链
+- POST /fhir/Patient/{rid}/$merge       患者合并（双版本乐观锁，幂等）
 - POST /deidentify                    对库内当前资源执行幂等去标识化
 """
 
@@ -38,6 +39,7 @@ _STATUS_MAP = {
     RejectReason.RESOURCE_NOT_FOUND: 404,
     RejectReason.VERSION_CONFLICT: 409,
     RejectReason.DUPLICATE_SUBMISSION: 200,
+    RejectReason.MERGED_RESOURCE: 409,
 }
 
 
@@ -142,6 +144,63 @@ def read_history(resource_type: str, resource_id: str) -> dict:
 @app.post("/deidentify")
 def deidentify_all() -> dict:
     return service.deidentify_all()
+
+
+@app.post("/fhir/Patient/{survivor_id}/$merge")
+async def merge_patients(
+    survivor_id: str,
+    request: Request,
+    idempotency_key: str | None = Header(default=None),
+) -> dict:
+    """患者合并：把 mergedId 并入路径中的保留记录。
+
+    请求体：{"mergedId": str, "expectedSurvivorVersion": int,
+             "expectedMergedVersion": int}；两个版本都必须与库内一致，
+    否则 409 且 context.staleResource 区分落后方。
+    """
+    import json
+
+    from .errors import RejectReason as R
+
+    raw = (await request.body()).decode("utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PipelineError(
+            R.MALFORMED_JSON, f"合并请求体不是合法 JSON: {exc}",
+            context={"snippet": raw[:80]},
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PipelineError(
+            R.NOT_AN_OBJECT, "合并请求体必须是 JSON 对象",
+            context={"actual_type": type(payload).__name__},
+        )
+    merged_id = payload.get("mergedId")
+    expected_survivor = payload.get("expectedSurvivorVersion")
+    expected_merged = payload.get("expectedMergedVersion")
+    if not isinstance(merged_id, str) or not merged_id:
+        raise PipelineError(
+            R.MISSING_FIELD, "合并请求缺少 mergedId（非空字符串）",
+            context={"field": "mergedId"},
+        )
+    for name, value in (
+        ("expectedSurvivorVersion", expected_survivor),
+        ("expectedMergedVersion", expected_merged),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PipelineError(
+                R.MISSING_FIELD,
+                f"合并请求缺少 {name}（整数版本号），禁止无版本合并",
+                context={"field": name},
+            )
+    result = service.merge_patients(
+        survivor_id,
+        merged_id,
+        expected_survivor_version=expected_survivor,
+        expected_merged_version=expected_merged,
+        idempotency_key=idempotency_key,
+    )
+    return result.to_dict()
 
 
 # ---------- 辅助 ----------

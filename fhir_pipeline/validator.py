@@ -18,9 +18,13 @@ class VersionedStoreView(Protocol):
 
     def exists(self, resource_type: str, resource_id: str) -> bool: ...
 
+    def merged_into(self, resource_type: str, resource_id: str) -> str | None:
+        """若目标是被合并的患者，返回保留记录 id，否则 None。"""
+        ...
+
 
 def validate_references(body: dict[str, Any], store: VersionedStoreView) -> None:
-    """校验 body 内所有引用；目标不存在即拒绝，不做静默跳过。"""
+    """校验 body 内所有引用；目标不存在或已并入他记录即拒绝，不做静默跳过。"""
     resource_type = body.get("resourceType")
     if not isinstance(resource_type, str):
         raise PipelineError(
@@ -47,6 +51,19 @@ def validate_references(body: dict[str, Any], store: VersionedStoreView) -> None
                     "field": field_name,
                     "targetType": target_type,
                     "targetId": target_id,
+                },
+            )
+        merged_target = store.merged_into(target_type, target_id)
+        if merged_target is not None:
+            raise PipelineError(
+                RejectReason.MERGED_RESOURCE,
+                f"字段 {field_name} 引用的 {target_type}/{target_id} 已并入 "
+                f"Patient/{merged_target}，请改指保留记录",
+                context={
+                    "field": field_name,
+                    "targetType": target_type,
+                    "targetId": target_id,
+                    "mergedInto": merged_target,
                 },
             )
 

@@ -32,6 +32,8 @@
 | 已存在的 id 走新建 | `version_conflict` | 409 | 必须改走更新 |
 | 更新携带的 `If-Match` 与当前版本一致、内容变化 | `updated`（v+1） | 200 | 追加不可变历史 |
 | 更新携带的 `If-Match` 落后于当前版本 | `version_conflict` | 409 | 明确拒绝，防止丢失更新 |
+| 内容有变化但不携带期望版本 | `version_conflict` | 409 | 任何入口都不做无版本覆盖 |
+| 更新/引用已并入他记录的患者 | `merged_resource` | 409 | `context.mergedInto` 指向保留记录，见[患者合并](MERGE.md) |
 | 同一幂等键绑定到别的资源/内容 | `version_conflict` | 409 | 重试误用，拒绝 |
 
 所有读改写在同一把锁内原子完成；并发更新中只有一个成功，其余全部得到
@@ -50,6 +52,7 @@
 | `reference_not_found` | 引用目标在库中不存在 | 422 |
 | `resource_not_found` | 读取/更新的资源不存在 | 404 |
 | `version_conflict` | 版本冲突 / 幂等键冲突 | 409 |
+| `merged_resource` | 目标患者已并入其他记录，禁止写入/引用 | 409 |
 | `duplicate_submission` | 重复提交（随 `duplicate` 结论返回，非错误） | 200 |
 
 ## 4. HTTP 接口
@@ -60,6 +63,7 @@ POST /fhir/{type}/{id}                  指定 id 新建
 PUT  /fhir/{type}/{id}                  更新（If-Match: W/<version> 或 <version>）
 GET  /fhir/{type}/{id}                  当前版本
 GET  /fhir/{type}/{id}/_history         历史版本链
+POST /fhir/Patient/{id}/$merge          患者合并（双版本乐观锁，见 MERGE.md）
 POST /deidentify                        对库内当前资源执行幂等去标识化
 ```
 

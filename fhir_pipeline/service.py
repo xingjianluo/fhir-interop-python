@@ -15,7 +15,7 @@ from typing import Any
 from . import normalizer
 from .deidentify import PseudonymMapper, deidentify_resource
 from .errors import PipelineError, RejectReason
-from .models import IngestResult, IngestStatus
+from .models import IngestResult, MergeResult
 from .store import ResourceStore
 from .validator import validate_references
 
@@ -34,6 +34,9 @@ class _SelfRefAwareStore:
         if self._self_key == (resource_type, resource_id):
             return True
         return self._store.exists(resource_type, resource_id)
+
+    def merged_into(self, resource_type: str, resource_id: str) -> str | None:
+        return self._store.merged_into(resource_type, resource_id)
 
 
 class IngestionService:
@@ -96,6 +99,24 @@ class IngestionService:
                 validate_references(
                     body, _SelfRefAwareStore(self.store, (resource_type, resource_id))
                 )
+                if (
+                    expected_version is None
+                    and existing.payload_hash != payload_hash
+                ):
+                    # 任何入口都禁止不核对版本就覆盖已有内容；
+                    # 内容一致的重复提交仍走 store 的 DUPLICATE 幂等路径
+                    raise PipelineError(
+                        RejectReason.VERSION_CONFLICT,
+                        f"更新 {resource_type}/{resource_id} 必须携带期望版本"
+                        f"（If-Match），库内当前 v{existing.version}，"
+                        "拒绝无版本覆盖",
+                        context={
+                            "resourceType": resource_type,
+                            "id": resource_id,
+                            "currentVersion": existing.version,
+                            "missingPrecondition": "expected_version",
+                        },
+                    )
                 result = self.store.update(
                     resource_type, resource_id, body, payload_hash,
                     expected_version=expected_version,
@@ -109,6 +130,48 @@ class IngestionService:
             raise
         logger.info("[%s] 判定结论 status=%s %s", rid, result.status.value,
                     result.detail)
+        return result
+
+    # ---------- 患者合并 ----------
+
+    def merge_patients(
+        self,
+        survivor_id: str,
+        merged_id: str,
+        *,
+        expected_survivor_version: int,
+        expected_merged_version: int,
+        idempotency_key: str | None = None,
+        request_id: str | None = None,
+    ) -> MergeResult:
+        """患者合并统一入口：版本核对 + 原子合并 + 引用改指。
+
+        三个入口（Python/HTTP/CLI）都走这里，结论一致；判定依据全部落日志。
+        """
+        rid = request_id or uuid.uuid4().hex[:8]
+        logger.info(
+            "[%s] 收到合并请求 survivor=Patient/%s#v%s merged=Patient/%s#v%s idem=%s",
+            rid, survivor_id, expected_survivor_version,
+            merged_id, expected_merged_version, idempotency_key,
+        )
+        try:
+            result = self.store.merge_patients(
+                survivor_id,
+                merged_id,
+                expected_survivor_version=expected_survivor_version,
+                expected_merged_version=expected_merged_version,
+                idempotency_key=idempotency_key,
+            )
+        except PipelineError as exc:
+            logger.warning(
+                "[%s] 拒绝合并 reason=%s 依据=%s context=%s",
+                rid, exc.reason.value, exc.message, exc.context,
+            )
+            raise
+        logger.info(
+            "[%s] 合并结论 status=%s 改指=%s 依据=%s",
+            rid, result.status.value, result.repointed, result.detail,
+        )
         return result
 
     # ---------- 查询 ----------

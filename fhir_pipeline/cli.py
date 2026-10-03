@@ -50,6 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_deid = sub.add_parser("deidentify", help="对库内资源执行幂等去标识化")
     p_deid.set_defaults(handler=_handle_deidentify)
+
+    p_merge = sub.add_parser("merge", help="患者合并：把被合并记录并入保留记录")
+    p_merge.add_argument("survivor_id", help="保留记录 id")
+    p_merge.add_argument("merged_id", help="被合并记录 id")
+    p_merge.add_argument("--survivor-version", type=int, required=True,
+                         help="发起人看到的保留记录版本（必填，乐观锁）")
+    p_merge.add_argument("--merged-version", type=int, required=True,
+                         help="发起人看到的被合并记录版本（必填，乐观锁）")
+    p_merge.add_argument("--key", dest="idempotency_key", default=None,
+                         help="合并幂等键（缺省按 合并对 派生）")
+    p_merge.set_defaults(handler=_handle_merge)
     return parser
 
 
@@ -109,6 +120,18 @@ def _handle_list(svc: IngestionService, _args: argparse.Namespace) -> int:
 
 def _handle_deidentify(svc: IngestionService, _args: argparse.Namespace) -> int:
     print(json.dumps(svc.deidentify_all(), ensure_ascii=False, indent=2))
+    return EXIT_OK
+
+
+def _handle_merge(svc: IngestionService, args: argparse.Namespace) -> int:
+    result = svc.merge_patients(
+        args.survivor_id,
+        args.merged_id,
+        expected_survivor_version=args.survivor_version,
+        expected_merged_version=args.merged_version,
+        idempotency_key=args.idempotency_key,
+    )
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     return EXIT_OK
 
 

@@ -19,6 +19,13 @@ class IngestStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class MergeStatus(str, Enum):
+    """一次患者合并请求的判定结论。"""
+
+    MERGED = "merged"
+    DUPLICATE = "duplicate"  # 同一合并请求重复提交：返回首次结论，不二次改写
+
+
 @dataclass
 class Resource:
     """归一化后的资源记录。
@@ -68,6 +75,35 @@ class IngestResult:
 
 
 @dataclass
+class MergeResult:
+    """患者合并入口返回的统一结论。"""
+
+    status: MergeStatus
+    survivor_id: str            # 保留记录 id
+    merged_id: str              # 被合并记录 id
+    survivor_version: int       # 合并时保留记录的版本
+    merged_version: int         # 合并后被合并记录的新版本（带合并标记）
+    repointed: list[dict[str, Any]] = field(default_factory=list)
+    # 每条: {"resourceType", "id", "fromVersion", "toVersion"}
+    merge_key: str = ""         # 合并幂等键
+    reason: str = ""
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "survivorId": self.survivor_id,
+            "mergedId": self.merged_id,
+            "survivorVersion": self.survivor_version,
+            "mergedVersion": self.merged_version,
+            "repointed": self.repointed,
+            "mergeKey": self.merge_key,
+            "reason": self.reason,
+            "detail": self.detail,
+        }
+
+
+@dataclass
 class HistoryEntry:
     """一个资源的某个历史版本。"""
 
@@ -89,9 +125,11 @@ class ResourceHistory:
 
 __all__ = [
     "SUPPORTED_TYPES",
-    "IngestStatus",
-    "Resource",
-    "IngestResult",
     "HistoryEntry",
+    "IngestResult",
+    "IngestStatus",
+    "MergeResult",
+    "MergeStatus",
+    "Resource",
     "ResourceHistory",
 ]

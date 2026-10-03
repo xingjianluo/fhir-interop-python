@@ -22,6 +22,7 @@ class RejectReason(str, Enum):
     RESOURCE_NOT_FOUND = "resource_not_found"
     VERSION_CONFLICT = "version_conflict"
     DUPLICATE_SUBMISSION = "duplicate_submission"
+    MERGED_RESOURCE = "merged_resource"  # 目标患者已被合并，禁止再写入/引用
 
 
 class PipelineError(Exception):

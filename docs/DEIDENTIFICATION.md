@@ -21,6 +21,7 @@ pseudoid = "PSEUDO-" + HMAC_SHA256(盐, "资源类型/真实id")[0:16]
 | --- | --- |
 | 资源自身 `id` | 替换为该类型+id 的伪标识 |
 | `subject.reference`、`encounter.reference` | 拆分出 `Type/id`，用**同一张映射表**改写，保持 `Type/伪id` 形态 |
+| `Patient.link[].other.reference`（合并标记） | 同样用该映射表改写；被合并记录的 `replaced-by` 指向保留记录的伪标识，引用保持闭合 |
 | `Patient.name` | 直接标识符，移除 |
 | `Patient.birthDate` | 精确日期泛化为出生年份（`1990-03-04 -> 1990`） |
 | `Patient.identifier[].value`（证件号等） | 以 `identifier/<真实值>` 为键映射为伪标识；同一证件号跨次/跨资源稳定 |
@@ -45,7 +46,17 @@ Encounter/PSEUDO-b <- Observation.encounter = Encounter/PSEUDO-b
   （测试 `test_repeated_run_is_idempotent_and_keeps_references`）；
 - 不会出现“二次去标识化产生新 id、把引用指向悬空目标”的情况。
 
-## 5. 使用方式
+## 5. 与患者合并的兼容
+
+[患者合并](MERGE.md)之后执行去标识化：
+
+- 被合并记录以伪标识保留在结果集中（不删除），其 `link` 指向保留记录的伪标识；
+- 所有已改指的引用（`subject/encounter`）与合并标记（`link`）用同一张映射表
+  改写，结果集内引用闭合、无指向被合并真实 id 的悬空引用；
+- 重复执行去标识化：映射不增、结果不变
+  （测试 `tests/test_merge.py::test_deidentify_after_merge_is_closed_and_stable`）。
+
+## 6. 使用方式
 
 ```python
 svc.ingest(patient); svc.ingest(encounter); svc.ingest(observation)
