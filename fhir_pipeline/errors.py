@@ -22,6 +22,9 @@ class RejectReason(str, Enum):
     RESOURCE_NOT_FOUND = "resource_not_found"
     VERSION_CONFLICT = "version_conflict"
     DUPLICATE_SUBMISSION = "duplicate_submission"
+    # 患者合并相关
+    MERGE_VERSION_CONFLICT = "merge_version_conflict"  # 合并基于的版本已落后
+    PATIENT_ALREADY_MERGED = "patient_already_merged"  # 目标患者已被合并（墓碑）
 
 
 class PipelineError(Exception):

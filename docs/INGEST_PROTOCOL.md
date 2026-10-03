@@ -50,6 +50,8 @@
 | `reference_not_found` | 引用目标在库中不存在 | 422 |
 | `resource_not_found` | 读取/更新的资源不存在 | 404 |
 | `version_conflict` | 版本冲突 / 幂等键冲突 | 409 |
+| `merge_version_conflict` | 患者合并基于的某一方版本已落后（context 标明哪侧、期望/当前版本） | 409 |
+| `patient_already_merged` | 引用/更新指向了已合并患者，或对墓碑再合并（context 给出 replacementId） | 409 |
 | `duplicate_submission` | 重复提交（随 `duplicate` 结论返回，非错误） | 200 |
 
 ## 4. HTTP 接口
@@ -60,6 +62,7 @@ POST /fhir/{type}/{id}                  指定 id 新建
 PUT  /fhir/{type}/{id}                  更新（If-Match: W/<version> 或 <version>）
 GET  /fhir/{type}/{id}                  当前版本
 GET  /fhir/{type}/{id}/_history         历史版本链
+POST /fhir/Patient/$merge               患者合并（双方版本必填，见 PATIENT_MERGE.md）
 POST /deidentify                        对库内当前资源执行幂等去标识化
 ```
 
@@ -96,10 +99,14 @@ POST /deidentify                        对库内当前资源执行幂等去标�
 uv run python -m fhir_pipeline.cli ingest -f examples/patient.json
 uv run python -m fhir_pipeline.cli ingest -f examples/observation.json --if-match 2 --key REQ-42
 uv run python -m fhir_pipeline.cli history Observation O1
+uv run python -m fhir_pipeline.cli merge --survivor P1 --merged P2 \
+    --survivor-version 1 --merged-version 1
 uv run python -m fhir_pipeline.cli deidentify
 ```
 
 拒绝时进程退出码为 `1`，stderr 输出含 `reason/detail/context` 的 JSON。
+合并后再向被合并患者写入或挂资源，会得到 `patient_already_merged`，详见
+[患者合并](PATIENT_MERGE.md)。
 
 ## 6. Python API
 

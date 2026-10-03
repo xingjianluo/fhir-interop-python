@@ -12,10 +12,10 @@ import logging
 import uuid
 from typing import Any
 
-from . import normalizer
+from . import merger, normalizer
 from .deidentify import PseudonymMapper, deidentify_resource
 from .errors import PipelineError, RejectReason
-from .models import IngestResult, IngestStatus
+from .models import IngestResult, MergeResult
 from .store import ResourceStore
 from .validator import validate_references
 
@@ -34,6 +34,11 @@ class _SelfRefAwareStore:
         if self._self_key == (resource_type, resource_id):
             return True
         return self._store.exists(resource_type, resource_id)
+
+    def patient_replacement(self, patient_id: str) -> str | None:
+        # 更新被合并患者自身的场景已在 store.update 处被墓碑保护拦截，
+        # 这里直接透传真实墓碑台账
+        return self._store.patient_replacement(patient_id)
 
 
 class IngestionService:
@@ -77,30 +82,34 @@ class IngestionService:
                 rid, resource_type, resource_id, payload_hash[:12],
             )
 
-            existing = self.store.get(resource_type, resource_id)
-            if existing is None:
-                if expected_version is not None:
-                    raise PipelineError(
-                        RejectReason.RESOURCE_NOT_FOUND,
-                        f"携带期望版本 v{expected_version} 更新，但资源 "
-                        f"{resource_type}/{resource_id} 不存在",
-                        context={"resourceType": resource_type, "id": resource_id},
+            # 引用校验与版本化写入必须与合并共用同一临界区：否则一次合并
+            # 可能在校验通过后、写入前把目标患者变成墓碑，留下悬空引用。
+            with self.store.atomic():
+                existing = self.store.get(resource_type, resource_id)
+                if existing is None:
+                    if expected_version is not None:
+                        raise PipelineError(
+                            RejectReason.RESOURCE_NOT_FOUND,
+                            f"携带期望版本 v{expected_version} 更新，但资源 "
+                            f"{resource_type}/{resource_id} 不存在",
+                            context={"resourceType": resource_type, "id": resource_id},
+                        )
+                    # 新建前校验引用（所有目标必须已入库）
+                    validate_references(body, self.store)
+                    result = self.store.create(
+                        resource_type, resource_id, body, payload_hash,
+                        idempotency_key=idempotency_key,
                     )
-                # 新建前校验引用（所有目标必须已入库）
-                validate_references(body, self.store)
-                result = self.store.create(
-                    resource_type, resource_id, body, payload_hash,
-                    idempotency_key=idempotency_key,
-                )
-            else:
-                validate_references(
-                    body, _SelfRefAwareStore(self.store, (resource_type, resource_id))
-                )
-                result = self.store.update(
-                    resource_type, resource_id, body, payload_hash,
-                    expected_version=expected_version,
-                    idempotency_key=idempotency_key,
-                )
+                else:
+                    validate_references(
+                        body, _SelfRefAwareStore(
+                            self.store, (resource_type, resource_id))
+                    )
+                    result = self.store.update(
+                        resource_type, resource_id, body, payload_hash,
+                        expected_version=expected_version,
+                        idempotency_key=idempotency_key,
+                    )
         except PipelineError as exc:
             logger.warning(
                 "[%s] 拒绝合入 reason=%s 依据=%s 输入=%s",
@@ -109,6 +118,58 @@ class IngestionService:
             raise
         logger.info("[%s] 判定结论 status=%s %s", rid, result.status.value,
                     result.detail)
+        return result
+
+    # ---------- 患者合并 ----------
+
+    def merge_patients(
+        self,
+        *,
+        surviving_patient_id: str,
+        merged_patient_id: str,
+        expected_surviving_version: int,
+        expected_merged_version: int,
+        idempotency_key: str | None = None,
+        request_id: str | None = None,
+    ) -> MergeResult:
+        """把两条重复患者记录合并为一条。
+
+        调用方必须携带其当时看到的两条记录版本；任一方在合并发起后被
+        改动即以 merge_version_conflict 明确拒绝（context 标明是保留方
+        还是被合并方落后、各自期望/当前版本）。整段改写原子完成。
+        """
+        rid = request_id or uuid.uuid4().hex[:8]
+        logger.info(
+            "[%s] 收到合并请求 survivor=Patient/%s@v%s merged=Patient/%s@v%s "
+            "idem=%s",
+            rid, surviving_patient_id, expected_surviving_version,
+            merged_patient_id, expected_merged_version, idempotency_key,
+        )
+        try:
+            with self.store.atomic():
+                result = self.store.merge_patients(
+                    surviving_id=surviving_patient_id,
+                    merged_id=merged_patient_id,
+                    expected_surviving_version=expected_surviving_version,
+                    expected_merged_version=expected_merged_version,
+                    transform_merged=lambda b: merger.build_tombstone(
+                        b, surviving_patient_id),
+                    transform_survivor=lambda b: merger.build_survivor(
+                        b, merged_patient_id),
+                    repoint_resource=merger.make_repointer(
+                        merged_patient_id, surviving_patient_id),
+                    idempotency_key=idempotency_key,
+                )
+        except PipelineError as exc:
+            logger.warning(
+                "[%s] 拒绝合并 reason=%s 依据=%s",
+                rid, exc.reason.value, exc.message,
+            )
+            raise
+        logger.info(
+            "[%s] 判定结论 status=%s 改指资源数=%d %s",
+            rid, result.status.value, len(result.repointed), result.detail,
+        )
         return result
 
     # ---------- 查询 ----------

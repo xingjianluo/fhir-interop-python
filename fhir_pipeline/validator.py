@@ -18,6 +18,10 @@ class VersionedStoreView(Protocol):
 
     def exists(self, resource_type: str, resource_id: str) -> bool: ...
 
+    def patient_replacement(self, patient_id: str) -> str | None:
+        """患者已被合并时返回保留患者 id，否则 None。"""
+        ...
+
 
 def validate_references(body: dict[str, Any], store: VersionedStoreView) -> None:
     """校验 body 内所有引用；目标不存在即拒绝，不做静默跳过。"""
@@ -49,6 +53,21 @@ def validate_references(body: dict[str, Any], store: VersionedStoreView) -> None
                     "targetId": target_id,
                 },
             )
+        # 指向已被合并的患者：明确拒绝并告知应改指哪条保留记录，
+        # 绝不允许新数据默默挂到墓碑 id 下
+        if target_type == "Patient":
+            replacement = store.patient_replacement(target_id)
+            if replacement is not None:
+                raise PipelineError(
+                    RejectReason.PATIENT_ALREADY_MERGED,
+                    f"字段 {field_name} 指向的 Patient/{target_id} 已被合并，"
+                    f"请改指保留记录 Patient/{replacement}",
+                    context={
+                        "field": field_name,
+                        "mergedId": target_id,
+                        "replacementId": replacement,
+                    },
+                )
 
 
 __all__ = ["VersionedStoreView", "validate_references"]

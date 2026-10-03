@@ -21,6 +21,7 @@ pseudoid = "PSEUDO-" + HMAC_SHA256(盐, "资源类型/真实id")[0:16]
 | --- | --- |
 | 资源自身 `id` | 替换为该类型+id 的伪标识 |
 | `subject.reference`、`encounter.reference` | 拆分出 `Type/id`，用**同一张映射表**改写，保持 `Type/伪id` 形态 |
+| `Patient.link[].other.reference` | 患者合并产生的 `replaced`/`replaces` 指针同样按映射改写，保证墓碑链接在伪标识空间仍闭合 |
 | `Patient.name` | 直接标识符，移除 |
 | `Patient.birthDate` | 精确日期泛化为出生年份（`1990-03-04 -> 1990`） |
 | `Patient.identifier[].value`（证件号等） | 以 `identifier/<真实值>` 为键映射为伪标识；同一证件号跨次/跨资源稳定 |
@@ -45,7 +46,19 @@ Encounter/PSEUDO-b <- Observation.encounter = Encounter/PSEUDO-b
   （测试 `test_repeated_run_is_idempotent_and_keeps_references`）；
 - 不会出现“二次去标识化产生新 id、把引用指向悬空目标”的情况。
 
-## 5. 使用方式
+## 5. 与患者合并的兼容
+
+合并后被合并患者是带 `link[type=replaced]` 的墓碑（`active=false`），保留
+患者带 `link[type=replaces]`，原挂在被合并患者名下的就诊/检验结果已改指
+保留患者。去标识化时：
+
+- 墓碑与保留患者的 `link` 指针随同一映射改写，互链仍指向彼此的伪标识；
+- 所有 `subject`/`encounter` 引用已在合并时改指，去标识化后仍指向存在的
+  伪标识目标，无悬空引用；
+- 重复去标识化映射不增、结果不变（见
+  `test_deid_after_merge_references_closed_and_stable`）。
+
+## 6. 使用方式
 
 ```python
 svc.ingest(patient); svc.ingest(encounter); svc.ingest(observation)

@@ -91,6 +91,19 @@ def deidentify_resource(
             t, i = _split_reference(ref["reference"])
             ref["reference"] = f"{t}/{mapper.pseudonym_for(t, i)}"
 
+    # 1b) Patient.link（合并产生的 replaced/replaces 指针）同样改写，
+    #     否则去标识化后墓碑链接会指向不存在的伪 id
+    if resource_type == "Patient" and isinstance(out.get("link"), list):
+        for link in out["link"]:
+            if not (
+                isinstance(link, dict)
+                and isinstance(link.get("other"), dict)
+                and isinstance(link["other"].get("reference"), str)
+            ):
+                continue
+            t, i = _split_reference(link["other"]["reference"])
+            link["other"]["reference"] = f"{t}/{mapper.pseudonym_for(t, i)}"
+
     # 2) 类型专属的直接标识符处理
     if resource_type == "Patient":
         out.pop("name", None)  # 姓名属于直接标识符，移除

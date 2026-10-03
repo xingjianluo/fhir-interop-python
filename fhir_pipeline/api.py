@@ -6,6 +6,7 @@
 - POST /fhir/{resource_type}/{rid}    新建指定 id（与 POST 集合语义一致）
 - GET  /fhir/{resource_type}/{rid}    读取当前版本
 - GET  /fhir/{resource_type}/{rid}/_history  历史版本链
+- POST /fhir/Patient/$merge         患者合并（双方版本必填，乐观并发）
 - POST /deidentify                    对库内当前资源执行幂等去标识化
 """
 
@@ -37,6 +38,8 @@ _STATUS_MAP = {
     RejectReason.REFERENCE_NOT_FOUND: 422,
     RejectReason.RESOURCE_NOT_FOUND: 404,
     RejectReason.VERSION_CONFLICT: 409,
+    RejectReason.MERGE_VERSION_CONFLICT: 409,
+    RejectReason.PATIENT_ALREADY_MERGED: 409,
     RejectReason.DUPLICATE_SUBMISSION: 200,
 }
 
@@ -58,6 +61,23 @@ async def pipeline_error_handler(request: Request, exc: PipelineError) -> JSONRe
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {"service": "fhir-local-ingest", "status": "ok"}
+
+
+# 注意：具体路径必须在 /fhir/{resource_type}/{resource_id} 这类参数化
+# 路由之前注册，否则 $merge 会被当成 resource_id 匹配进合入流程。
+@app.post("/fhir/Patient/$merge")
+async def merge_patients(
+    request: Request,
+    idempotency_key: str | None = Header(default=None),
+) -> dict:
+    """把两条重复患者合并为一条。
+
+    体：{"survivingPatientId", "mergedPatientId",
+         "expectedSurvivingVersion", "expectedMergedVersion"}。
+    版本字段必填（发起人当时看到的版本），用于并发冲突判定。
+    """
+    raw = (await request.body()).decode("utf-8")
+    return _handle_merge_request(raw, idempotency_key=idempotency_key)
 
 
 @app.post("/fhir/{resource_type}")
@@ -145,6 +165,69 @@ def deidentify_all() -> dict:
 
 
 # ---------- 辅助 ----------
+
+def _handle_merge_request(raw: str, *, idempotency_key: str | None) -> dict:
+    """解析并校验合并请求体，调用同一 IngestionService 完成合并。"""
+    import json
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise PipelineError(
+            RejectReason.MALFORMED_JSON, "合并请求体不是合法 JSON",
+            context={"snippet": raw[:80]},
+        )
+    if not isinstance(payload, dict):
+        raise PipelineError(
+            RejectReason.NOT_AN_OBJECT, "合并请求体必须是 JSON 对象",
+        )
+
+    surviving_id = payload.get("survivingPatientId")
+    merged_id = payload.get("mergedPatientId")
+    sv = payload.get("expectedSurvivingVersion")
+    mv = payload.get("expectedMergedVersion")
+    for field_name, value in (
+        ("survivingPatientId", surviving_id),
+        ("mergedPatientId", merged_id),
+        ("expectedSurvivingVersion", sv),
+        ("expectedMergedVersion", mv),
+    ):
+        if value is None:
+            raise PipelineError(
+                RejectReason.MISSING_FIELD,
+                f"合并请求缺少必填字段 {field_name}",
+                context={"field": field_name},
+            )
+    for field_name, value in (
+        ("survivingPatientId", surviving_id),
+        ("mergedPatientId", merged_id),
+    ):
+        if not isinstance(value, str) or not value:
+            raise PipelineError(
+                RejectReason.INVALID_VALUE,
+                f"{field_name} 必须是非空字符串",
+                context={"field": field_name, "value": value},
+            )
+    for field_name, value in (
+        ("expectedSurvivingVersion", sv),
+        ("expectedMergedVersion", mv),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PipelineError(
+                RejectReason.INVALID_VALUE,
+                f"{field_name} 必须是整数版本号",
+                context={"field": field_name, "value": value},
+            )
+
+    result = service.merge_patients(
+        surviving_patient_id=surviving_id,
+        merged_patient_id=merged_id,
+        expected_surviving_version=sv,
+        expected_merged_version=mv,
+        idempotency_key=idempotency_key,
+    )
+    return result.to_dict()
+
 
 def _ingest_with_type_check(
     raw: str,
