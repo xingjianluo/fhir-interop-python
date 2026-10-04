@@ -1,6 +1,8 @@
 """线程安全的版本化内存存储。
 
-并发安全：所有读改写均在同一把 RLock 内完成（原子 check-then-act）。
+并发安全：所有读改写均在同一把可重入 RLock 内完成（原子 check-then-act）。
+编排层的“引用校验 + 写入”必须包在 store.transaction() 临界区内，
+避免校验通过后目标患者被并发合并作废（TOCTOU）导致悬空引用写入。
 不丢更新：更新必须携带期望版本号（乐观锁），与库内不一致即
 VERSION_CONFLICT 拒绝。
 不重复：同一幂等键（默认取内容哈希）的重复提交返回 DUPLICATE，
@@ -12,6 +14,8 @@ from __future__ import annotations
 
 import copy
 import threading
+from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 from .errors import PipelineError, RejectReason
@@ -41,8 +45,24 @@ class ResourceStore:
         self._idempotency: dict[str, tuple[tuple[str, str], int, str]] = {}
         # 合并幂等键 -> 首次合并结论（重复提交原样返回，不二次改写）
         self._merges: dict[str, MergeResult] = {}
+        # 合并临界区内的阶段回调（测试用并发插桩，生产为 None）：
+        # 在“双方存在性/作废状态/版本全部核对通过之后、任何改写发生之前”触发，
+        # 触发时仍持有写锁，因此可用来确定性地制造交错。
+        self.merge_barrier: Callable[[str, str], None] | None = None
 
     # ---------- 读 ----------
+
+    @contextmanager
+    def transaction(self):
+        """存储写临界区：check-then-act（引用校验 + 写入）必须在同一事务内。
+
+        底层是可重入锁，create/update/merge_patients 内部也会获取同一把锁，
+        因此编排层可以先进入事务做引用校验，再调用写方法，整个
+        “校验-判定-写入”过程对其他线程不可见，杜绝校验通过后目标患者
+        被并发合并作废（TOCTOU）导致悬空引用写入。
+        """
+        with self._lock:
+            yield
 
     def exists(self, resource_type: str, resource_id: str) -> bool:
         with self._lock:
@@ -287,6 +307,9 @@ class ResourceStore:
     ) -> MergeResult:
         """把被合并患者并入保留患者（原子操作，全程持锁）。
 
+        - 保留记录必须仍是有效患者：已作废（被合并过）的记录不得作为
+          保留记录，否则 MERGED_RESOURCE 拒绝，context.role="survivor"，
+          并给出去向 mergedInto；
         - 两条记录各自的期望版本必须与库内一致，否则 VERSION_CONFLICT，
           context.staleResource 区分 "survivor"/"merged" 并给出当前版本；
         - 同一合并键重复提交 -> DUPLICATE，返回首次结论，不二次改写；
@@ -335,6 +358,26 @@ class ResourceStore:
                     context={"resourceType": "Patient", "id": merged_id},
                 )
 
+            # 保留记录本身必须仍是有效（未被合并）的患者：
+            # 绝不允许把作废记录当保留记录，否则引用会被改指到一条
+            # active=false、已 replaced-by 他记录的死链上。
+            survivor_target = merged_target_of(survivor.body)
+            if survivor_target is not None:
+                raise PipelineError(
+                    RejectReason.MERGED_RESOURCE,
+                    f"保留记录 Patient/{survivor_id} 已作废并并入 "
+                    f"Patient/{survivor_target}，不能作为合并的保留记录；"
+                    f"请改以 Patient/{survivor_target} 为保留记录重新发起",
+                    context={
+                        "role": "survivor",
+                        "survivorId": survivor_id,
+                        "mergedInto": survivor_target,
+                        "requestedMergedId": merged_id,
+                        "currentSurvivorVersion": survivor.version,
+                        "currentMergedVersion": merged.version,
+                    },
+                )
+
             already = merged_target_of(merged.body)
             if already is not None:
                 if already == survivor_id:
@@ -360,9 +403,12 @@ class ResourceStore:
                     f"Patient/{merged_id} 已并入 Patient/{already}，"
                     "不能再次并入其他记录",
                     context={
+                        "role": "merged",
                         "mergedId": merged_id,
                         "mergedInto": already,
                         "requestedSurvivor": survivor_id,
+                        "currentSurvivorVersion": survivor.version,
+                        "currentMergedVersion": merged.version,
                     },
                 )
 
@@ -392,6 +438,10 @@ class ResourceStore:
                         "currentSurvivorVersion": survivor.version,
                     },
                 )
+
+            # 全部核对通过、任何改写之前：触发并发插桩（测试用）
+            if self.merge_barrier is not None:
+                self.merge_barrier(survivor_id, merged_id)
 
             # 1) 所有引用被合并患者的资源改指保留患者（版本 +1 + 历史）
             repointed: list[dict[str, Any]] = []

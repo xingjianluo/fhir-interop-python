@@ -81,47 +81,53 @@ class IngestionService:
             )
 
             existing = self.store.get(resource_type, resource_id)
-            if existing is None:
-                if expected_version is not None:
-                    raise PipelineError(
-                        RejectReason.RESOURCE_NOT_FOUND,
-                        f"携带期望版本 v{expected_version} 更新，但资源 "
-                        f"{resource_type}/{resource_id} 不存在",
-                        context={"resourceType": resource_type, "id": resource_id},
+            # 引用校验与最终写入必须处于同一个存储临界区：否则校验通过之后、
+            # 写入之前，目标患者可能恰好被并发合并作废，从而把悬空引用
+            # 写进库里（TOCTOU）。事务内合并无法插入，任何“赶不上合并”
+            # 的写入都会在事务内看到作废标记并被明确拒绝。
+            with self.store.transaction():
+                if existing is None:
+                    if expected_version is not None:
+                        raise PipelineError(
+                            RejectReason.RESOURCE_NOT_FOUND,
+                            f"携带期望版本 v{expected_version} 更新，但资源 "
+                            f"{resource_type}/{resource_id} 不存在",
+                            context={"resourceType": resource_type, "id": resource_id},
+                        )
+                    # 新建前校验引用（所有目标必须已入库且未作废）
+                    validate_references(body, self.store)
+                    result = self.store.create(
+                        resource_type, resource_id, body, payload_hash,
+                        idempotency_key=idempotency_key,
                     )
-                # 新建前校验引用（所有目标必须已入库）
-                validate_references(body, self.store)
-                result = self.store.create(
-                    resource_type, resource_id, body, payload_hash,
-                    idempotency_key=idempotency_key,
-                )
-            else:
-                validate_references(
-                    body, _SelfRefAwareStore(self.store, (resource_type, resource_id))
-                )
-                if (
-                    expected_version is None
-                    and existing.payload_hash != payload_hash
-                ):
-                    # 任何入口都禁止不核对版本就覆盖已有内容；
-                    # 内容一致的重复提交仍走 store 的 DUPLICATE 幂等路径
-                    raise PipelineError(
-                        RejectReason.VERSION_CONFLICT,
-                        f"更新 {resource_type}/{resource_id} 必须携带期望版本"
-                        f"（If-Match），库内当前 v{existing.version}，"
-                        "拒绝无版本覆盖",
-                        context={
-                            "resourceType": resource_type,
-                            "id": resource_id,
-                            "currentVersion": existing.version,
-                            "missingPrecondition": "expected_version",
-                        },
+                else:
+                    validate_references(
+                        body,
+                        _SelfRefAwareStore(self.store, (resource_type, resource_id)),
                     )
-                result = self.store.update(
-                    resource_type, resource_id, body, payload_hash,
-                    expected_version=expected_version,
-                    idempotency_key=idempotency_key,
-                )
+                    if (
+                        expected_version is None
+                        and existing.payload_hash != payload_hash
+                    ):
+                        # 任何入口都禁止不核对版本就覆盖已有内容；
+                        # 内容一致的重复提交仍走 store 的 DUPLICATE 幂等路径
+                        raise PipelineError(
+                            RejectReason.VERSION_CONFLICT,
+                            f"更新 {resource_type}/{resource_id} 必须携带期望版本"
+                            f"（If-Match），库内当前 v{existing.version}，"
+                            "拒绝无版本覆盖",
+                            context={
+                                "resourceType": resource_type,
+                                "id": resource_id,
+                                "currentVersion": existing.version,
+                                "missingPrecondition": "expected_version",
+                            },
+                        )
+                    result = self.store.update(
+                        resource_type, resource_id, body, payload_hash,
+                        expected_version=expected_version,
+                        idempotency_key=idempotency_key,
+                    )
         except PipelineError as exc:
             logger.warning(
                 "[%s] 拒绝合入 reason=%s 依据=%s 输入=%s",

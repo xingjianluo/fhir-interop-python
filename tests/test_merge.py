@@ -6,6 +6,7 @@
 import json
 import logging
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,6 +28,56 @@ OBS_ON_P2 = {"resourceType": "Observation", "id": "O1", "status": "final",
              "subject": {"reference": "Patient/P2"},
              "encounter": {"reference": "Encounter/E1"},
              "valueQuantity": {"value": 5.5}}
+
+
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    """轮询直到 predicate 为真（仅用于测试线程同步，不参与业务判定）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class _LockWaitTracker:
+    """包裹存储写锁，记录当前正阻塞等待该锁的线程 ident（测试确定性交错用）。"""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.waiting: set[int] = set()
+
+    def acquire(self, *args, **kwargs):
+        ident = threading.get_ident()
+        self.waiting.add(ident)
+        try:
+            return self._inner.acquire(*args, **kwargs)
+        finally:
+            # 拿到锁即不再“等待”；拿不到时线程阻塞在此行之前，ident 保留
+            self.waiting.discard(ident)
+
+    def release(self) -> None:
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def _assert_no_references_to(svc: IngestionService, reference: str) -> None:
+    """最终不变量：库内不存在任何 subject/encounter 指向 reference 的资源。"""
+    offenders = []
+    for resource in svc.store.all_resources():
+        for field_name in ("subject", "encounter"):
+            ref = resource.body.get(field_name)
+            if isinstance(ref, dict) and ref.get("reference") == reference:
+                offenders.append((resource.resource_type, resource.resource_id,
+                                  field_name))
+    assert not offenders, f"发现悬空引用指向 {reference}: {offenders}"
+
 
 
 def make_service() -> IngestionService:
@@ -164,6 +215,107 @@ def test_merged_patient_cannot_be_merged_elsewhere():
     assert exc.value.context["mergedInto"] == "P1"
 
 
+# ---------- 已作废记录不得当保留记录 ----------
+
+def test_voided_patient_cannot_be_used_as_survivor():
+    """拿已被并掉的患者当保留记录：明确拒绝（merged_resource, role=survivor），
+    不执行任何改写，更不能把引用改指到作废记录上。"""
+    svc = make_service()
+    svc.ingest(P3)
+    enc_on_p3 = {"resourceType": "Encounter", "id": "E3", "status": "finished",
+                 "subject": {"reference": "Patient/P3"}}
+    svc.ingest(enc_on_p3)
+    # P2 先并入 P1：P2 自此作废（active=false, replaced-by -> P1）
+    svc.merge_patients("P1", "P2", **merge_kwargs())
+
+    # 后来想把 P3 也并过来，却误选了已作废的 P2 作为保留记录
+    with pytest.raises(PipelineError) as exc:
+        svc.merge_patients("P2", "P3", expected_survivor_version=2,
+                           expected_merged_version=1)
+    assert exc.value.reason is RejectReason.MERGED_RESOURCE
+    ctx = exc.value.context
+    assert ctx["role"] == "survivor"
+    assert ctx["survivorId"] == "P2"
+    assert ctx["mergedInto"] == "P1"
+    assert "P1" in exc.value.message  # 说清原因与正确做法
+
+    # P3 身上的就诊没有被改指到作废的 P2
+    assert svc.get("Encounter", "E3").body["subject"]["reference"] == "Patient/P3"
+    # P3 仍有效、P2 仍只指向 P1，数据未被改一半
+    assert svc.get("Patient", "P3").body.get("active", True) is True
+    assert svc.get("Patient", "P2").body["link"] == [
+        {"other": {"reference": "Patient/P1"}, "type": "replaced-by"}
+    ]
+    _assert_no_references_to(svc, "Patient/P2")
+
+
+def test_chained_merge_onto_active_survivor_succeeds():
+    """合法的链式合并：P2 并入 P1 后，再把 P3 并入仍有效的 P1，正常执行。"""
+    svc = make_service()
+    svc.ingest(P3)
+    enc_on_p3 = {"resourceType": "Encounter", "id": "E3", "status": "finished",
+                 "subject": {"reference": "Patient/P3"}}
+    svc.ingest(enc_on_p3)
+    svc.merge_patients("P1", "P2", **merge_kwargs())
+
+    result = svc.merge_patients("P1", "P3", expected_survivor_version=1,
+                                expected_merged_version=1)
+    assert result.status.value == "merged"
+    assert svc.get("Encounter", "E3").body["subject"]["reference"] == "Patient/P1"
+    assert svc.get("Encounter", "E1").body["subject"]["reference"] == "Patient/P1"
+    _assert_no_references_to(svc, "Patient/P2")
+    _assert_no_references_to(svc, "Patient/P3")
+
+
+def test_voided_survivor_rejection_agrees_across_entries(monkeypatch, capsys):
+    """Python / CLI / HTTP 对“作废记录当保留记录”给出一致的拒绝结论。"""
+    def _setup(svc: IngestionService) -> None:
+        svc.ingest(P1)
+        svc.ingest(P2)
+        svc.ingest(P3)
+        svc.merge_patients("P1", "P2", **merge_kwargs())  # P2 -> v2 作废
+
+    # Python 入口
+    svc = IngestionService()
+    _setup(svc)
+    with pytest.raises(PipelineError) as py_exc:
+        svc.merge_patients("P2", "P3", expected_survivor_version=2,
+                           expected_merged_version=1)
+    assert py_exc.value.reason is RejectReason.MERGED_RESOURCE
+    assert py_exc.value.context["role"] == "survivor"
+    assert py_exc.value.context["mergedInto"] == "P1"
+
+    # CLI 入口：非零退出码 + 同样的 reason/context
+    svc2 = IngestionService()
+    _setup(svc2)
+    monkeypatch.setattr(cli, "IngestionService", lambda: svc2)
+    rc = cli.main(["merge", "P2", "P3",
+                   "--survivor-version", "2", "--merged-version", "1"])
+    assert rc == cli.EXIT_REJECTED
+    err = json.loads(capsys.readouterr().err)
+    assert err["reason"] == "merged_resource"
+    assert err["context"]["role"] == "survivor"
+    assert err["context"]["mergedInto"] == "P1"
+
+    # HTTP 入口：409 + 同样的 reason/context
+    api.reset_service()
+    client = TestClient(api.app)
+    for body in (P1, P2, P3):
+        client.post(f"/fhir/{body['resourceType']}", json=body)
+    client.post("/fhir/Patient/P1/$merge",
+                json={"mergedId": "P2", "expectedSurvivorVersion": 1,
+                      "expectedMergedVersion": 1})
+    r = client.post("/fhir/Patient/P2/$merge",
+                    json={"mergedId": "P3", "expectedSurvivorVersion": 2,
+                          "expectedMergedVersion": 1})
+    assert r.status_code == 409
+    payload = r.json()
+    assert payload["reason"] == "merged_resource"
+    assert payload["context"]["role"] == "survivor"
+    assert payload["context"]["mergedInto"] == "P1"
+
+
+
 # ---------- 合并后的写入处置 ----------
 
 def test_update_merged_patient_rejected_with_distinguishable_reason():
@@ -234,6 +386,92 @@ def test_concurrent_merges_only_one_succeeds():
         f"Patient/{survivor}")
 
 
+def test_concurrent_merges_deterministic_only_one_wins():
+    """并发合并的确定性版本：第二个合并在第一个持锁期间排队，
+    必以可区分的版本冲突（或已合并）被拒绝，不产生第二条改指链。"""
+    svc = make_service()
+    svc.ingest(P3)
+    tracker = _LockWaitTracker(svc.store._lock)
+    svc.store._lock = tracker
+    passed = threading.Event()
+    release = threading.Event()
+    svc.store.merge_barrier = lambda s, m: (passed.set(), release.wait(timeout=5))
+
+    outcomes, errors = [], []
+
+    def merge_p1_p2():
+        try:
+            outcomes.append(svc.merge_patients(
+                "P1", "P2", expected_survivor_version=1,
+                expected_merged_version=1))
+        except PipelineError as exc:
+            errors.append(exc)
+
+    def merge_p3_p2():
+        try:
+            outcomes.append(svc.merge_patients(
+                "P3", "P2", expected_survivor_version=1,
+                expected_merged_version=1))
+        except PipelineError as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=merge_p1_p2)
+    second = threading.Thread(target=merge_p3_p2)
+    first.start()
+    assert passed.wait(timeout=5)      # P1<-P2 已核对通过并持锁
+    second.start()
+    assert _wait_until(lambda: second.ident in tracker.waiting, timeout=5)
+    release.set()
+    first.join()
+    second.join()
+
+    assert len(outcomes) == 1 and outcomes[0].survivor_id == "P1"
+    assert len(errors) == 1
+    assert errors[0].reason is RejectReason.VERSION_CONFLICT
+    _assert_no_references_to(svc, "Patient/P2")
+    assert svc.get("Encounter", "E1").body["subject"]["reference"] == "Patient/P1"
+
+
+def test_merge_pinned_before_blocked_update():
+    """合并与更新抢跑（合并先）的确定性版本：更新在合并临界区外排队，
+    合并提交后更新必以 merged_resource 被拒绝，互不覆盖、不改一半。"""
+    svc = make_service()
+    tracker = _LockWaitTracker(svc.store._lock)
+    svc.store._lock = tracker
+    passed = threading.Event()
+    release = threading.Event()
+    svc.store.merge_barrier = lambda s, m: (passed.set(), release.wait(timeout=5))
+
+    update_outcome: dict = {}
+
+    def do_update():
+        try:
+            update_outcome["result"] = svc.ingest(
+                {**P2, "gender": "female"}, expected_version=1)
+        except PipelineError as exc:
+            update_outcome["error"] = exc
+
+    mt = threading.Thread(target=lambda: svc.merge_patients(
+        "P1", "P2", **merge_kwargs()))
+    ut = threading.Thread(target=do_update)
+    mt.start()
+    assert passed.wait(timeout=5)
+    ut.start()
+    assert _wait_until(lambda: ut.ident in tracker.waiting, timeout=5)
+    release.set()
+    mt.join()
+    ut.join()
+
+    assert "error" in update_outcome
+    assert update_outcome["error"].reason is RejectReason.MERGED_RESOURCE
+    assert update_outcome["error"].context["mergedInto"] == "P1"
+    # 被拒更新没有留下半截内容：性别仍为 v1 的 male，合并标记完整
+    p2 = svc.get("Patient", "P2")
+    assert p2.version == 2
+    assert p2.body["gender"] == "male"
+    assert p2.body["active"] is False
+
+
 def test_merge_races_with_update_on_merged_patient():
     """合并与被合并患者的并发更新：必有一方被明确拒绝，互不覆盖。"""
     svc = make_service()
@@ -278,43 +516,77 @@ def test_merge_races_with_update_on_merged_patient():
 
 
 def test_merge_races_with_new_encounter_on_merged_patient():
-    """合并进行中向被合并患者挂新就诊：要么先入库后被改指，要么被明确拒绝，
-    合并完成后绝不留指向被合并 id 的悬空引用。"""
-    for _ in range(20):  # 多跑几轮覆盖不同交错
-        svc = make_service()
-        barrier = threading.Barrier(2)
-        outcome = {}
+    """合并进行中向被合并患者挂新就诊：两种交错均不留悬空引用。
 
-        def do_merge(svc=svc, barrier=barrier, outcome=outcome):
-            barrier.wait()
-            outcome["merge"] = svc.merge_patients("P1", "P2", **merge_kwargs())
-
-        def do_create(svc=svc, barrier=barrier, outcome=outcome):
-            barrier.wait()
-            try:
-                outcome["create"] = svc.ingest(
-                    {"resourceType": "Encounter", "id": "E9",
+    不依赖“多跑几轮碰运气”，而是通过 store 的合并阶段插桩
+    （merge_barrier，在持锁状态、核对通过后/改写前触发）确定性地
+    构造两种交错各一次。
+    """
+    new_encounter = {"resourceType": "Encounter", "id": "E9",
                      "status": "planned",
-                     "subject": {"reference": "Patient/P2"}})
-            except PipelineError as exc:
-                outcome["create_error"] = exc
+                     "subject": {"reference": "Patient/P2"}}
 
-        t1, t2 = threading.Thread(target=do_merge), threading.Thread(target=do_create)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+    # ---- 交错 A：合并先完成，新建被锁挡在临界区外 -> 明确拒绝 ----
+    svc = make_service()
+    tracker = _LockWaitTracker(svc.store._lock)
+    svc.store._lock = tracker
+    merge_passed_checks = threading.Event()
+    release_merge = threading.Event()
 
-        assert outcome["merge"].status.value == "merged"
-        if "create_error" in outcome:
-            # 合并先完成：新建被明确拒绝，没有默默写入
-            assert outcome["create_error"].reason is RejectReason.MERGED_RESOURCE
-            assert svc.get("Encounter", "E9") is None
-        else:
-            # 新建先完成：合并必须把它一并改指，不留悬空引用
-            assert outcome["create"].status.value == "created"
-            assert svc.get("Encounter", "E9").body["subject"]["reference"] == (
-                "Patient/P1")
+    def barrier(survivor_id, merged_id, *,
+                passed=merge_passed_checks, go=release_merge):
+        passed.set()
+        go.wait(timeout=5)
+
+    svc.store.merge_barrier = barrier
+
+    def do_merge():
+        svc.merge_patients("P1", "P2", **merge_kwargs())
+
+    mt = threading.Thread(target=do_merge)
+    mt.start()
+    assert merge_passed_checks.wait(timeout=5)  # 合并已核对通过并持锁
+
+    create_outcome: dict = {}
+
+    def do_create():
+        try:
+            create_outcome["result"] = svc.ingest(dict(new_encounter))
+        except PipelineError as exc:
+            create_outcome["error"] = exc
+
+    ct = threading.Thread(target=do_create)
+    ct.start()
+    # 等到新建线程确实阻塞在写锁上，再放行合并 -> 合并必然先提交
+    assert _wait_until(lambda: ct.ident in tracker.waiting, timeout=5)
+    release_merge.set()
+    mt.join()
+    ct.join()
+
+    assert "error" in create_outcome
+    assert create_outcome["error"].reason is RejectReason.MERGED_RESOURCE
+    assert create_outcome["error"].context["mergedInto"] == "P1"
+    assert svc.get("Encounter", "E9") is None  # 没有悄悄写进去
+    _assert_no_references_to(svc, "Patient/P2")
+
+    # ---- 交错 B：新建先提交，随后合并扫描到它 -> 一并改指 ----
+    svc = make_service()
+
+    def barrier_then_create(survivor_id, merged_id, *, service=svc):
+        # 仍持合并写锁：合并已核对通过但尚未改指。
+        # 事务可重入，此刻写入等价于“资源恰好赶在合并扫描前提交”。
+        created = service.ingest(dict(new_encounter))
+        assert created.status.value == "created"
+
+    svc.store.merge_barrier = barrier_then_create
+    result = svc.merge_patients("P1", "P2", **merge_kwargs())
+    assert result.status.value == "merged"
+    assert {"resourceType": "Encounter", "id": "E9"} in [
+        {"resourceType": r["resourceType"], "id": r["id"]}
+        for r in result.repointed
+    ]
+    assert svc.get("Encounter", "E9").body["subject"]["reference"] == "Patient/P1"
+    _assert_no_references_to(svc, "Patient/P2")
 
 
 # ---------- 三入口结论一致 ----------

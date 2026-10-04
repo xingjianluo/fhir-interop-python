@@ -12,7 +12,7 @@ uv sync
 uv run pytest -q
 ```
 
-预期：`55 passed`。测试文件：
+预期：`60 passed`。测试文件：
 
 | 文件 | 覆盖点 |
 | --- | --- |
@@ -21,7 +21,7 @@ uv run pytest -q
 | `tests/test_deidentify.py` | 跨资源同一真实标识一致、去标识化后引用闭合可解析、重复执行映射不增引用不乱、直接标识符移除/泛化 |
 | `tests/test_service.py` | 三资源端到端合入、Duplicate 与 Conflict 的可区分结论与上下文、并发无丢失更新、去标识化二次执行稳定 |
 | `tests/test_api.py` | HTTP 状态码映射（400/409/422/404）、`If-Match` 乐观锁、`Idempotency-Key` 头、历史接口、去标识化接口 |
-| `tests/test_merge.py` | 患者合并：引用改指与标记、重复提交幂等、双方版本落后可区分、并发合并只成功一个、合并与更新/新建竞争无悬空引用、三入口结论一致、合并后去标识化闭合且幂等 |
+| `tests/test_merge.py` | 患者合并：引用改指与标记、重复提交幂等、双方版本落后可区分、**已作废记录不得当保留记录（`merged_resource`/`role=survivor`，三入口一致）**、合法链式合并、并发合并与“合并 vs 更新/新建”竞争的**确定性交错**（持锁阶段插桩，不靠碰运气）无悬空引用、三入口结论一致、合并后去标识化闭合且幂等 |
 
 ## 3. 查看测试中的输入与判定依据日志
 
@@ -64,9 +64,17 @@ curl -i -X PUT localhost:8000/fhir/Patient/P1 -H 'If-Match: 1' \
 # 历史版本
 curl -s localhost:8000/fhir/Patient/P1/_history
 # 患者合并（P2 并入 P1，双版本乐观锁）
-curl -s -X POST localhost:8000/fhir/Patient/P1/\$merge \
+curl -s localhost:8000/fhir/Patient/P1/\$merge \
   -H 'Content-Type: application/json' \
   -d '{"mergedId":"P2","expectedSurvivorVersion":1,"expectedMergedVersion":1}'
+# 误把已作废的 P2 当保留记录再并 P3 -> 409 merged_resource，role=survivor
+curl -i -X POST localhost:8000/fhir/Patient/P2/\$merge \
+  -H 'Content-Type: application/json' \
+  -d '{"mergedId":"P3","expectedSurvivorVersion":2,"expectedMergedVersion":1}'
+# 合并后再向被合并患者挂就诊 -> 409 merged_resource
+curl -i -X POST localhost:8000/fhir/Encounter \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"EX","status":"planned","subject":{"reference":"Patient/P2"}}'
 # 去标识化
 curl -s -X POST localhost:8000/deidentify
 ```
