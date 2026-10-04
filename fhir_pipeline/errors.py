@@ -23,6 +23,8 @@ class RejectReason(str, Enum):
     VERSION_CONFLICT = "version_conflict"
     DUPLICATE_SUBMISSION = "duplicate_submission"
     MERGED_RESOURCE = "merged_resource"  # 目标患者已被合并，禁止再写入/引用
+    # 指定的保留记录本身已被合并（已作废），不能再作为合并保留方
+    SURVIVOR_MERGED = "survivor_merged"
 
 
 class PipelineError(Exception):

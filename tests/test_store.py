@@ -106,3 +106,41 @@ def test_idempotency_key_bound_to_other_resource_conflicts():
     with pytest.raises(PipelineError) as exc:
         store.create("Patient", "P2", PATIENT_BODY, "hash-9", idempotency_key="KEY-1")
     assert exc.value.reason is RejectReason.VERSION_CONFLICT
+
+
+def test_write_guard_runs_under_lock_and_aborts_create():
+    """write_guard 在落库前执行：抛错则新记录完全不存在，无半写入。"""
+    store = ResourceStore()
+
+    def reject(_body):
+        raise PipelineError(RejectReason.MERGED_RESOURCE, "guard 拒绝",
+                            context={"mergedInto": "P9"})
+
+    with pytest.raises(PipelineError) as exc:
+        store.create("Encounter", "E1", {"id": "E1"}, "h1", write_guard=reject)
+    assert exc.value.reason is RejectReason.MERGED_RESOURCE
+    assert store.get("Encounter", "E1") is None
+    assert store.all_resources() == []
+
+    # guard 通过后正常落库
+    result = store.create("Encounter", "E1", {"id": "E1"}, "h1",
+                          write_guard=lambda _b: None)
+    assert result.status.value == "created"
+
+
+def test_write_guard_aborts_update_without_touching_current_version():
+    """update 的 guard 抛错时，当前版本与历史链保持原样。"""
+    store = ResourceStore()
+    store.create("Patient", "P1", PATIENT_BODY, "hash-1")
+
+    def reject(_body):
+        raise PipelineError(RejectReason.MERGED_RESOURCE, "guard 拒绝")
+
+    with pytest.raises(PipelineError) as exc:
+        store.update("Patient", "P1", {**PATIENT_BODY, "gender": "female"},
+                     "hash-2", expected_version=1, write_guard=reject)
+    assert exc.value.reason is RejectReason.MERGED_RESOURCE
+    current = store.get("Patient", "P1")
+    assert current.version == 1
+    assert current.payload_hash == "hash-1"
+    assert len(store.history("Patient", "P1").entries) == 1

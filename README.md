@@ -9,7 +9,7 @@
 
 ```bash
 uv sync
-uv run pytest -q                      # 55 个测试
+uv run pytest -q                      # 64 个测试
 uv run fastapi dev fhir_pipeline/api.py
 ```
 

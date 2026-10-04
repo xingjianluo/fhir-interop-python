@@ -12,7 +12,7 @@ uv sync
 uv run pytest -q
 ```
 
-预期：`55 passed`。测试文件：
+预期：`64 passed`。测试文件：
 
 | 文件 | 覆盖点 |
 | --- | --- |
@@ -21,7 +21,19 @@ uv run pytest -q
 | `tests/test_deidentify.py` | 跨资源同一真实标识一致、去标识化后引用闭合可解析、重复执行映射不增引用不乱、直接标识符移除/泛化 |
 | `tests/test_service.py` | 三资源端到端合入、Duplicate 与 Conflict 的可区分结论与上下文、并发无丢失更新、去标识化二次执行稳定 |
 | `tests/test_api.py` | HTTP 状态码映射（400/409/422/404）、`If-Match` 乐观锁、`Idempotency-Key` 头、历史接口、去标识化接口 |
-| `tests/test_merge.py` | 患者合并：引用改指与标记、重复提交幂等、双方版本落后可区分、并发合并只成功一个、合并与更新/新建竞争无悬空引用、三入口结论一致、合并后去标识化闭合且幂等 |
+| `tests/test_merge.py` | 患者合并：引用改指与标记、重复提交幂等、保留记录资格（`survivor_merged` 三入口一致）、双方版本落后可区分且报双版本、并发合并只成功一个、合并与更新/新建的**确定性交错**竞争（无悬空引用、晚到写入被明确拒绝）、合并后去标识化闭合且幂等 |
+
+每条用例的业务含义直接写在其 docstring 里；加 `-v` 运行时，每条用例后会
+追加打印该业务说明与通过情况，例如：
+
+```bash
+uv run pytest tests/test_merge.py -v
+# tests/test_merge.py::test_already_merged_patient_cannot_be_survivor PASSED
+#   业务：P2 已并入 P1 后，再拿 P2 当保留记录并 P3：必须以专门原因拒绝 ...
+```
+
+并发交错用例不靠重试碰运气：`_IngestGate` 在校验点用事件固定线程顺序，
+单次运行即可稳定复现（详见 [患者合并](MERGE.md) 第 7 节）。
 
 ## 3. 查看测试中的输入与判定依据日志
 

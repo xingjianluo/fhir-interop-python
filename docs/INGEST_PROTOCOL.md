@@ -34,6 +34,7 @@
 | 更新携带的 `If-Match` 落后于当前版本 | `version_conflict` | 409 | 明确拒绝，防止丢失更新 |
 | 内容有变化但不携带期望版本 | `version_conflict` | 409 | 任何入口都不做无版本覆盖 |
 | 更新/引用已并入他记录的患者 | `merged_resource` | 409 | `context.mergedInto` 指向保留记录，见[患者合并](MERGE.md) |
+| 拿已作废（被并掉）的患者当合并保留记录 | `survivor_merged` | 409 | `context.survivorMergedInto` 指向当前有效记录，无副作用 |
 | 同一幂等键绑定到别的资源/内容 | `version_conflict` | 409 | 重试误用，拒绝 |
 
 所有读改写在同一把锁内原子完成；并发更新中只有一个成功，其余全部得到
@@ -53,6 +54,7 @@
 | `resource_not_found` | 读取/更新的资源不存在 | 404 |
 | `version_conflict` | 版本冲突 / 幂等键冲突 | 409 |
 | `merged_resource` | 目标患者已并入其他记录，禁止写入/引用 | 409 |
+| `survivor_merged` | 指定的合并保留记录本身已作废（被并掉） | 409 |
 | `duplicate_submission` | 重复提交（随 `duplicate` 结论返回，非错误） | 200 |
 
 ## 4. HTTP 接口

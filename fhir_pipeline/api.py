@@ -40,6 +40,7 @@ _STATUS_MAP = {
     RejectReason.VERSION_CONFLICT: 409,
     RejectReason.DUPLICATE_SUBMISSION: 200,
     RejectReason.MERGED_RESOURCE: 409,
+    RejectReason.SURVIVOR_MERGED: 409,
 }
 
 

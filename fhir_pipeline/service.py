@@ -89,16 +89,18 @@ class IngestionService:
                         f"{resource_type}/{resource_id} 不存在",
                         context={"resourceType": resource_type, "id": resource_id},
                     )
-                # 新建前校验引用（所有目标必须已入库）
+                # 新建前校验引用（所有目标必须已入库）；锁外预检给出
+                # 常规拒绝，锁内 write_guard 负责兜住与合并竞争的并发写入
                 validate_references(body, self.store)
                 result = self.store.create(
                     resource_type, resource_id, body, payload_hash,
                     idempotency_key=idempotency_key,
+                    write_guard=lambda b: validate_references(b, self.store),
                 )
             else:
-                validate_references(
-                    body, _SelfRefAwareStore(self.store, (resource_type, resource_id))
-                )
+                self_ref_view = _SelfRefAwareStore(
+                    self.store, (resource_type, resource_id))
+                validate_references(body, self_ref_view)
                 if (
                     expected_version is None
                     and existing.payload_hash != payload_hash
@@ -121,6 +123,7 @@ class IngestionService:
                     resource_type, resource_id, body, payload_hash,
                     expected_version=expected_version,
                     idempotency_key=idempotency_key,
+                    write_guard=lambda b: validate_references(b, self_ref_view),
                 )
         except PipelineError as exc:
             logger.warning(

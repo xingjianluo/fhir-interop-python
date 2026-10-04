@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from .errors import PipelineError, RejectReason
@@ -28,6 +29,11 @@ from .normalizer import _REFERENCE_FIELDS, compute_payload_hash
 
 # 被合并患者在 body 中的标记：link[type=replaced-by].other.reference
 MERGE_LINK_TYPE = "replaced-by"
+
+# 锁内提交点校验：在真正写入前再核对一次引用（目标存在且未作废）。
+# 调用时持有存储锁，因此“校验 + 写入”是原子的，杜绝
+# “校验通过后、写入前引用目标被合并作废”的并发悬空引用。
+WriteGuard = Callable[[dict[str, Any]], None]
 
 
 class ResourceStore:
@@ -91,13 +97,16 @@ class ResourceStore:
         payload_hash: str,
         *,
         idempotency_key: str | None = None,
+        write_guard: WriteGuard | None = None,
     ) -> IngestResult:
         """新建资源（版本 1）。
 
         - 幂等键首次出现 -> CREATED；
         - 同键再次提交且指向同一资源 -> DUPLICATE；
         - 同键被用于不同内容/不同资源 -> VERSION_CONFLICT（请求方误用）；
-        - 资源 id 已存在但走 create -> VERSION_CONFLICT（应改用 update）。
+        - 资源 id 已存在但走 create -> VERSION_CONFLICT（应改用 update）；
+        - write_guard 在锁内、真正落库前执行；失败（如引用目标恰在并发
+          合并中被作废）则整笔新建被拒绝，库内不留半写入数据。
         """
         key = (resource_type, resource_id)
         idem = idempotency_key or payload_hash
@@ -146,6 +155,11 @@ class ResourceStore:
                     },
                 )
 
+            # 锁内最后一道校验：此时引用目标若已被并发合并作废，
+            # 必须拒绝，绝不能把指向作废患者的资源写进库
+            if write_guard is not None:
+                write_guard(body)
+
             resource = Resource(
                 resource_type=resource_type,
                 resource_id=resource_id,
@@ -175,11 +189,14 @@ class ResourceStore:
         *,
         expected_version: int | None = None,
         idempotency_key: str | None = None,
+        write_guard: WriteGuard | None = None,
     ) -> IngestResult:
         """更新已有资源。
 
         - expected_version 与库内当前版本不一致 -> VERSION_CONFLICT；
         - 内容哈希与当前版本一致（重复提交）-> DUPLICATE，不新增版本；
+        - write_guard 在锁内、提交新版本前执行：引用目标在并发合并中
+          被作废时整笔更新被拒绝，现有版本保持不变（不被改一半）；
         - 否则 -> UPDATED，版本号 +1 并追加历史。
         """
         key = (resource_type, resource_id)
@@ -245,6 +262,11 @@ class ResourceStore:
                     context={"idempotencyKey": idem},
                 )
 
+            # 锁内最后一道校验：引用目标若已被并发合并作废则拒绝，
+            # 现有版本原样保留，不会出现“主体改了但引用悬空”的半成品
+            if write_guard is not None:
+                write_guard(body)
+
             new_version = existing.version + 1
             updated = Resource(
                 resource_type=resource_type,
@@ -287,6 +309,8 @@ class ResourceStore:
     ) -> MergeResult:
         """把被合并患者并入保留患者（原子操作，全程持锁）。
 
+        - 保留记录必须当前有效：其本身已被合并（作废）时给出
+          SURVIVOR_MERGED，明确拒绝、不写任何数据；
         - 两条记录各自的期望版本必须与库内一致，否则 VERSION_CONFLICT，
           context.staleResource 区分 "survivor"/"merged" 并给出当前版本；
         - 同一合并键重复提交 -> DUPLICATE，返回首次结论，不二次改写；
@@ -333,6 +357,25 @@ class ResourceStore:
                     RejectReason.RESOURCE_NOT_FOUND,
                     f"被合并记录不存在: Patient/{merged_id}",
                     context={"resourceType": "Patient", "id": merged_id},
+                )
+
+            # 保留记录资格：已经作废（被并掉）的患者不能再当保留记录。
+            # 必须在任何版本核对/写入之前拒绝，避免把引用改指到已作废记录。
+            survivor_target = merged_target_of(survivor.body)
+            if survivor_target is not None:
+                raise PipelineError(
+                    RejectReason.SURVIVOR_MERGED,
+                    f"保留记录 Patient/{survivor_id} 已并入 "
+                    f"Patient/{survivor_target}（已作废），不能再作为合并的"
+                    "保留记录；请以当前有效记录 "
+                    f"Patient/{survivor_target} 作为保留记录重试",
+                    context={
+                        "survivorId": survivor_id,
+                        "survivorMergedInto": survivor_target,
+                        "survivorCurrentVersion": survivor.version,
+                        "mergedId": merged_id,
+                        "mergedCurrentVersion": merged.version,
+                    },
                 )
 
             already = merged_target_of(merged.body)
